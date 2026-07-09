@@ -125,3 +125,114 @@ request parsing/validation, **service** (`services/notification_service.py`,
 with a supporting read from `services/playlist_service.py`) for business
 logic, and **models** (`models.py`'s `Playlist`, `Song`, `User`,
 `playlist_entries`, `Notification`) for persistence.
+
+---
+
+# Bug Fixes
+
+## Issue #1: My listening streak keeps resetting
+
+### How I reproduced it
+
+Before touching any code, I looked at `tests/test_streaks.py`, which already
+had a test encoding the expected behavior: `test_streak_increments_on_sunday`.
+It listens on Saturday, June 15 2024 (`weekday() == 5`), then on Sunday,
+June 16 2024 (`weekday() == 6`), and asserts the streak goes from 1 to 2
+(consecutive days should always increment, regardless of which day of the
+week it is).
+
+I ran the streak suite to confirm this failed *before* making any changes:
+
+```
+.venv/bin/python -m pytest tests/test_streaks.py -v
+```
+
+Result: 4 tests passed, but `test_streak_increments_on_sunday` failed with
+`assert 1 == 2` — the streak was reset to 1 on Sunday instead of
+incrementing to 2. This confirmed the bug exists independent of any of my
+assumptions, using inputs that isolate the day-of-week as the only variable
+(same one-day gap as the passing `test_streak_increments_on_consecutive_day`
+case, just shifted to a Sat→Sun boundary).
+
+### How I found the root cause
+
+I opened `services/streak_service.py` (the file the README's issue table
+points to for this bug) and read `update_listening_streak()`, the only
+function that mutates `listening_streak`. Its docstring states the rule
+plainly: increment on a one-day gap, reset on more than a one-day gap, no
+day-of-week exception is mentioned anywhere in the spec.
+
+Reading the implementation line by line, the branch that decides between
+"increment" and "reset" was:
+
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+    user.listening_streak += 1
+else:
+    user.listening_streak = 1
+```
+
+The `and today.weekday() != 6` clause was the moment of confidence — it's an
+extra condition with no basis in the docstring, no basis in the other tests,
+and no comment explaining it. `datetime.weekday()` returns `6` for Sunday, so
+this clause silently forces any listen that happens to fall on a Sunday into
+the `else` branch — even when `days_since_last == 1`, which is exactly the
+"consecutive day" case that should increment. That pinpointed the exact
+faulty comparison, not just the general area.
+
+### The root cause
+
+`update_listening_streak()` had an extra, undocumented condition tacked onto
+the "consecutive day" check: it only incremented the streak on a one-day gap
+if today was *not* Sunday (`today.weekday() != 6`). Since Python's
+`date.weekday()` returns `6` for Sunday, any time a user's streak-continuing
+listen happened to land on a Sunday, the function skipped the increment
+branch entirely and fell through to the `else`, which resets the streak to
+1 — identical to the "you skipped a day" case. The bug wasn't in how the day
+gap (`days_since_last`) was computed (that arithmetic was correct); it was an
+unrelated, incorrect extra clause gating the increment on which weekday it
+happened to be.
+
+### My fix and side-effect check
+
+I removed the erroneous weekday clause so the condition matches the
+documented rule — a one-day gap always increments, regardless of weekday:
+
+```python
+elif days_since_last == 1:
+    user.listening_streak += 1
+```
+
+This fixes the root cause directly: the increment branch no longer depends
+on `today.weekday()` at all, so Saturday→Sunday, Sunday→Monday, and every
+other consecutive-day pair now behave identically to any other weekday pair.
+
+To check for side effects, I ran the full `tests/test_streaks.py` suite
+(not just the one failing test) plus the full project test suite:
+
+```
+.venv/bin/python -m pytest tests/ -v
+```
+
+All 5 streak tests now pass, including:
+- New-user streak starts at 1
+- Same-day repeat listens don't double-count
+- A skipped day still resets to 1
+- Consecutive weekdays still increment
+- Saturday → Sunday now increments (previously failing)
+
+The other two failures in the full suite (`tests/test_playlists.py`) are
+pre-existing and unrelated to this change — they correspond to Issue #5
+(the last song in a playlist not showing up), which lives in
+`playlist_service.py` and is untouched by this fix.
+
+
+
+Issues solved:
+Issue #1 - My listening streak keeps resetting
+
+
+Issue #2 — Friends Listening Now shows people from yesterday
+
+
+Issue #3 — The same song keeps showing up twice in search

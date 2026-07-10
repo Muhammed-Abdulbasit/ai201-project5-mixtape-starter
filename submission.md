@@ -431,12 +431,3 @@ untouched `Song.tags` relationship) still returns the correct tags for
 "Crown Heights Anthem" (`rap`, `hip-hop`, `boom bap`) with the join removed.
 
 
-
-Issues solved:
-Issue #1 - My listening streak keeps resetting
-
-
-Issue #2 — Friends Listening Now shows people from yesterday
-
-
-Issue #3 — The same song keeps showing up twice in search

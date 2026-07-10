@@ -226,6 +226,96 @@ pre-existing and unrelated to this change — they correspond to Issue #5
 (the last song in a playlist not showing up), which lives in
 `playlist_service.py` and is untouched by this fix.
 
+## Issue #2: Friends Listening Now shows people from yesterday
+
+### How I reproduced it
+
+Unlike Issue #1, there was no pre-existing test for the feed service, so I
+first read the reported symptom carefully: a friend whose last listen was
+"yesterday evening" still shows up under "Friends Listening Now" the next
+morning.
+
+I wrote a small reproduction test (`tests/test_feed.py`) mirroring the
+fixture conventions already used in `test_streaks.py`/`test_playlists.py`: a
+user with one friend, and a `ListeningEvent` for that friend timestamped
+`now - timedelta(hours=12)` (simulating "listened yesterday evening, checked
+this morning"). I asserted `get_friends_listening_now()` should return `[]`
+for that friend, then ran it *before* changing any service code:
+
+```
+.venv/bin/python -m pytest tests/test_feed.py -v
+```
+
+Result: `test_listening_now_excludes_listen_from_yesterday_evening` failed —
+the stale friend was present in the returned feed — confirming the bug with
+a concrete, minimal input (a single friend, a single 12-hour-old event)
+rather than relying on the full seed dataset.
+
+### How I found the root cause
+
+The README's issue table points at `services/feed_service.py` for this bug,
+so I read `get_friends_listening_now()` top to bottom. The function's own
+docstring says it should return friends who listened "recently," and the
+query filters events with `ListeningEvent.listened_at >= cutoff`, where
+`cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`. That's the correct
+shape for a recency filter — the arithmetic and the comparison operator
+(`>=`) are both right, so the bug had to be in what "recent" was actually
+defined as.
+
+`RECENT_THRESHOLD` is declared once, at module level: `timedelta(hours=24)`.
+That was the moment of confidence — a 24-hour window means any event from
+"yesterday evening" checked "this morning" (a gap of well under 24 hours)
+passes the filter and is treated as happening "now." I cross-checked this
+against `seed_data.py`'s comments, which explicitly describe the intended
+behavior: events "within the past 30 minutes" should appear in listening
+now, while everything else (including the "1-14 days ago" bucket, which
+actually starts at just 2 hours old) should not. A 24-hour cutoff directly
+contradicts that 30-minute intent and explains exactly why multi-hour-old
+events were leaking through.
+
+### The root cause
+
+`get_friends_listening_now()` filtered listening events using
+`RECENT_THRESHOLD = timedelta(hours=24)` as the definition of "right now."
+A feature named "listening now" implies real-time presence, but the
+implementation was actually answering a different question — "did this
+friend listen at all in the last day?" Any event up to just under 24 hours
+old passed the `listened_at >= cutoff` check, so a friend who listened at
+9pm the previous evening would still show up as "listening now" at 9am the
+next morning (a 12-hour gap, comfortably inside the 24-hour window). The
+comparison logic itself was correct; the constant it was compared against
+was simply set to the wrong order of magnitude for what the feature is
+supposed to mean.
+
+### My fix and side-effect check
+
+I narrowed `RECENT_THRESHOLD` from 24 hours down to 30 minutes, matching the
+"listening now" semantics documented in `seed_data.py`'s comments:
+
+```python
+RECENT_THRESHOLD = timedelta(minutes=30)
+```
+
+This fixes the root cause directly: the cutoff now actually represents "a
+few minutes ago," so events from hours or days earlier no longer pass the
+`listened_at >= cutoff` filter, while genuinely-recent events still do.
+
+To check for side effects, I first reran the two feed tests I wrote — the
+previously-failing 12-hours-ago case now returns `[]`, and a second test
+with a listen 10 minutes ago still correctly returns that friend — then ran
+the full project test suite:
+
+```
+.venv/bin/python -m pytest tests/ -v
+```
+
+All streak, search, and (new) feed tests pass (13 total). The two remaining
+failures in `tests/test_playlists.py` are the pre-existing, unrelated
+Issue #5. I also re-read `get_activity_feed()` in the same file to confirm
+it wasn't affected — its docstring explicitly states it is "not filtered by
+recency," and its query never references `RECENT_THRESHOLD` at all, so
+narrowing that constant has no effect on the general activity feed.
+
 
 
 Issues solved:

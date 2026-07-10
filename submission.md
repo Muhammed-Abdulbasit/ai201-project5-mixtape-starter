@@ -316,6 +316,120 @@ it wasn't affected — its docstring explicitly states it is "not filtered by
 recency," and its query never references `RECENT_THRESHOLD` at all, so
 narrowing that constant has no effect on the general activity feed.
 
+## Issue #3: The same song keeps showing up twice (or three times) in search
+
+### How I reproduced it
+
+The report was specific: searching "Anthem" returned "Crown Heights Anthem"
+by Borough Kings three times, with no visible difference between the
+copies, while other songs appeared once. Per `seed_data.py`, "Crown Heights
+Anthem" is exactly the song seeded with **three** tags (`rap`, `hip-hop`,
+`boom bap`) — the number of duplicates matching the number of tags was the
+first clue.
+
+There was already a pre-written test for this,
+`tests/test_search.py::test_search_no_duplicates_multi_tag_song`, whose
+comment literally reads "Should be 1, bug causes it to be 3." I ran the
+search suite first:
+
+```
+.venv/bin/python -m pytest tests/test_search.py -v
+```
+
+Surprisingly, all 5 tests passed on this machine's installed SQLAlchemy
+version (2.0.51) — the automated test alone did not reproduce the bug. Since
+that contradicted your direct report, I didn't take the green test suite at
+face value; I dropped down a level and inspected the actual SQL being
+executed rather than the ORM's post-processed result. I compiled the
+query's raw statement and ran it directly (bypassing the ORM's entity
+mapping) against a song with 3 tags:
+
+```
+raw row count: 3   (from db.session.execute(q.statement).all())
+orm entity count: 1 (from q.all())
+```
+
+That confirmed the underlying SQL genuinely returns 3 duplicate rows — the
+ORM's legacy `Query.all()` was silently collapsing them back down to 1
+distinct entity via its automatic identity-map "uniquing" for full-entity
+queries, an implicit, version-dependent behavior that isn't guaranteed
+across SQLAlchemy versions/APIs (2.0-style `select()`/`session.execute()`
+queries do *not* get this automatic collapsing and would raise an error
+demanding an explicit `.unique()` call for the same query shape). That's
+consistent with you seeing real duplicates in your run while my first test
+pass looked clean — the bug is real in the SQL layer; whether it's visible
+depends on incidental ORM/version behavior, not on anything the code
+actually guarantees.
+
+### How I found the root cause
+
+The README points at `services/search_service.py` for this issue, and it's
+a short file. `search_songs()`'s query does two things: an
+`.outerjoin(song_tags, Song.id == song_tags.c.song_id)`, then a `.filter()`
+that only checks `Song.title` and `Song.artist`. The moment of confidence
+was noticing that the join column (`song_tags`) is never referenced
+anywhere in the `.filter()` or anywhere else in the query — it's not used to
+filter, sort, or select anything. `song_tags` is a many-to-many association
+table (one row per song/tag pair), so outer-joining a song to it multiplies
+that song's result rows by however many tags it has: 1 row for a 0-tag song,
+1 for a 1-tag song, but 3 rows for a 3-tag song — exactly matching "Crown
+Heights Anthem" (3 tags → 3 identical copies) versus every other song in
+your report showing up once.
+
+### The root cause
+
+`search_songs()` joined `Song` to the `song_tags` association table even
+though the search filter never uses tags at all — title/artist matching is
+the only condition. Since `song_tags` has one row per `(song, tag)` pair,
+outer-joining to it turns each matching song into as many result rows as it
+has tags (a Cartesian product), so a song with 3 tags comes back 3 times
+with completely identical data (there's no difference between the copies
+because every column being displayed comes from `Song`, not from the tag
+join — the "extra" rows purely reflect the different tag join it happened
+to match). The tags shown in each result are already fetched separately via
+`Song.tags` (a `lazy="subquery"` relationship used inside `to_dict()`), so
+the join in the search query wasn't accomplishing anything except
+multiplying rows.
+
+### My fix and side-effect check
+
+I removed the unnecessary join, along with the now-unused `Tag`/`song_tags`
+imports, since the query never needed to touch the tags table at all:
+
+```python
+results = (
+    db.session.query(Song)
+    .filter(
+        db.or_(
+            Song.title.ilike(f"%{query}%"),
+            Song.artist.ilike(f"%{query}%"),
+        )
+    )
+    .all()
+)
+```
+
+This fixes the root cause at the SQL level, not just by relying on the
+ORM's incidental deduplication: I re-verified by compiling and executing the
+raw statement directly, and the "Anthem" search against the 3-tag song now
+returns exactly 1 raw row (previously 3), before the ORM even gets a chance
+to collapse anything.
+
+To check for side effects, I ran the full search suite plus the whole
+project test suite:
+
+```
+.venv/bin/python -m pytest tests/ -v
+```
+
+All streak, search (5/5, including the multi-tag case), and feed tests pass
+(13 total); the two remaining `test_playlists.py` failures are the same
+pre-existing, unrelated Issue #5. I also re-checked `get_song()` in the same
+file (single-song lookup by ID) — it never touched `song_tags` in the first
+place, so it's unaffected — and confirmed `to_dict()`'s tags list (via the
+untouched `Song.tags` relationship) still returns the correct tags for
+"Crown Heights Anthem" (`rap`, `hip-hop`, `boom bap`) with the join removed.
+
 
 
 Issues solved:
